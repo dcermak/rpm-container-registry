@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "rpm-container-registry"
+version = "0.0.1"
+description = "Container Registry serving locally installed OCI images from RPMs"
+authors = ["Dan Čermák <dcermak@suse.com>"]
+license = "GPLv2"
+readme = "README.rst"
+packages = [
+    { include = "rpm-container-registry" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.103"
+rpm = "^0.1.0"
+obs-package-update = { git = "https://github.com/dcermak/obs-package-update", branch = "main" }
+uvicorn = {extras = ["standard"], version = "^0.23.2"}
+aiofiles = "^23.2.1"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.10.0"
+ruff = "^0.1.0"
+pytest = "^7.4.2"
+mypy = "^1.6.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+app = "uvicorn rpm-container-registry:app --reload"

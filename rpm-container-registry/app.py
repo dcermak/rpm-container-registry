@@ -4,6 +4,7 @@ import logging
 from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
+import hashlib
 from pydantic import BaseModel
 import os.path
 import json
@@ -27,87 +28,25 @@ class TagReply(BaseModel):
     tags: list[str]
 
 
-# class ManifestV1Reply(BaseModel):
-#     class BlobSum(BaseModel):
-#         blobSum: str
-
-#     name: str
-#     tag: str
-#     fsLayers: list[BlobSum]
-#     history: list[Any]
-
-#     schemaVersion: Literal[1] = 1
-#     # FIXME:
-#     signature: Any = [{}]
-
-
 class ChecksumMixin:
     @property
     def checksum(self) -> str:
         return self.digest.split(":")[1]
 
 
-class DockerManifest(BaseModel, ChecksumMixin):
-    class Platform(BaseModel):
-        architecture: str
-        os: str
-
-    mediaType: Literal[
-        "application/vnd.docker.distribution.manifest.v2+json"
-    ] = "application/vnd.docker.distribution.manifest.v2+json"
-    size: int
-    digest: str
-    platform: Platform
-
-
-MANIFEST_LIST_V2_MEDIA_TYPE = (
-    "application/vnd.docker.distribution.manifest.list.v2+json"
-)
-
-
-class ManifestListV2Reply(BaseModel):
-    manifests: list[DockerManifest]
-
-    schemaVersion: Literal[2] = 2
-    mediaType: Literal[
-        "application/vnd.docker.distribution.manifest.list.v2+json"
-    ] = MANIFEST_LIST_V2_MEDIA_TYPE
+OCI_IMAGE_INDEX_JSON_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
 
 
 class IndexJson(BaseModel):
     class Manifest(BaseModel, ChecksumMixin):
-        mediaType: Literal["application/vnd.oci.image.manifest.v1+json"]
+        mediaType: Literal[
+            "application/vnd.oci.image.manifest.v1+json"
+        ] = "application/vnd.oci.image.manifest.v1+json"
         digest: str
         size: int
 
     schemaVersion: Literal[2]
     manifests: list[Manifest]
-
-
-MANIFEST_V2_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
-
-
-class ManifestV2Reply(BaseModel):
-    class Config(BaseModel, ChecksumMixin):
-        mediaType: Literal[
-            "application/vnd.docker.container.image.v1+json"
-        ] = "application/vnd.docker.container.image.v1+json"
-        digest: str
-        size: int
-
-    class Layer(BaseModel, ChecksumMixin):
-        mediaType: Literal[
-            "application/vnd.docker.image.rootfs.diff.tar.gzip"
-        ] = "application/vnd.docker.image.rootfs.diff.tar.gzip"
-        digest: str
-        size: int
-
-    schemaVersion: Literal[2] = 2
-    mediaType: Literal[
-        "application/vnd.docker.distribution.manifest.v2+json"
-    ] = MANIFEST_V2_MEDIA_TYPE
-    config: Config
-    layers: list[Layer]
 
 
 OCI_IMAGE_CONFIG_MEDIA_TYPE = "application/vnd.oci.image.config.v1+json"
@@ -132,17 +71,6 @@ class OciManifest(BaseModel):
     mediaType: Literal["application/vnd.oci.image.manifest.v1+json"]
     config: Config
     layers: list[Layer]
-
-    def to_docker_manifest(self) -> ManifestV2Reply:
-        return ManifestV2Reply(
-            config=ManifestV2Reply.Config(
-                digest=self.config.digest, size=self.config.size
-            ),
-            layers=[
-                ManifestV2Reply.Layer(digest=layer.digest, size=layer.size)
-                for layer in self.layers
-            ],
-        )
 
 
 class OciConfig(BaseModel):
@@ -222,7 +150,7 @@ async def package_names_from_rpm(
                 res.append(pkg)
                 break
 
-    return res
+    return list(set(res))
 
 
 @app.get("/v2/")
@@ -231,10 +159,10 @@ async def get_base():
     return {}
 
 
-@app.head("/v2/{name}/manifests/{reference}")
-async def check_manifest_exists(name: str, reference: str):
-    # FIXME
-    return {}
+# @app.head("/v2/{name}/manifests/{reference}")
+# async def check_manifest_exists(name: str, reference: str):
+#     # FIXME
+#     return {}
 
 
 @app.get("/v2/{name:path}/tags/list")
@@ -281,35 +209,6 @@ async def send_digest(name: str, digest: str):
     return FileResponse(digest_file)
 
 
-async def manifests_from_name(name: str, tag: str) -> list[DockerManifest]:
-    pkgs = await package_names_from_rpm(name, tag)
-    if not pkgs:
-        raise HTTPException(status_code=404, detail=f"Image {name}:{tag} not found")
-
-    manifests: list[DockerManifest] = []
-
-    for pkg in pkgs:
-        pkg_name, arch = (
-            await run_cmd(f'rpm -q --qf "%{{name}} %{{arch}}" {pkg}')
-        ).stdout.split(" ")
-
-        arch = "amd64" if arch == "x86_64" else arch
-
-        index_json, _, _ = await read_in_oci_image(pkg_name)
-
-        manifests.extend(
-            [
-                DockerManifest(
-                    size=manifest.size,
-                    digest=manifest.digest,
-                    platform=DockerManifest.Platform(architecture=arch, os="linux"),
-                )
-                for manifest in index_json.manifests
-            ]
-        )
-    return manifests
-
-
 async def manifests_from_sha_digest(digest: str) -> OciManifest | None:
     manifest_pkg_query = await run_cmd(
         f"rpm -q --whatprovides 'oci_manifest({digest})'",
@@ -330,18 +229,44 @@ async def manifests_from_sha_digest(digest: str) -> OciManifest | None:
     return manifest
 
 
+async def get_index_json_path_from_pkg_name(pkg_name: str) -> str | None:
+    files = (await run_cmd(f"rpm -ql {pkg_name}")).stdout.splitlines()
+    for fname in files:
+        if fname.endswith("index.json"):
+            return fname
+    return None
+
+
 @app.get("/v2/{name:path}/manifests/{reference}")
 async def read_manifest(name: str, reference: str) -> Response:
     """https://docs.docker.com/registry/spec/api/#pulling-an-image-manifest"""
 
     if reference.startswith("sha256:"):
+        # could be the oci manifest being requested
         manifest = await manifests_from_sha_digest(reference)
-        if not manifest:
+        if manifest:
+            return Response(
+                content=manifest.model_dump_json(),
+                media_type=manifest.mediaType,
+            )
+
+        # or it is the index.json being requested by hash
+        # FIXME: this could actually be solved via a rpm provides too
+        pkgs = await package_names_from_rpm(name)
+        if not pkgs:
             raise HTTPException(status_code=404, detail=f"digest {reference} not found")
-        return Response(
-            content=manifest.model_dump_json(),
-            media_type=manifest.mediaType,
-        )
+
+        for pkg in pkgs:
+            if index_json_path := await get_index_json_path_from_pkg_name(pkg):
+                with open(index_json_path, "rb") as index_json_f:
+                    digest = hashlib.file_digest(index_json_f, "sha256")
+                    if f"sha256:{digest.hexdigest()}" == reference:
+                        return FileResponse(
+                            path=index_json_path,
+                            media_type=OCI_IMAGE_INDEX_JSON_MEDIA_TYPE,
+                        )
+
+        raise HTTPException(status_code=404, detail=f"digest {reference} not found")
 
     pkgs = await package_names_from_rpm(name, reference)
     if not pkgs:
@@ -349,30 +274,14 @@ async def read_manifest(name: str, reference: str) -> Response:
             status_code=404, detail=f"Image {name}:{reference} not found"
         )
 
-    manifests: list[DockerManifest] = []
-
-    for pkg in pkgs:
-        pkg_name, arch = (
-            await run_cmd(f'rpm -q --qf "%{{name}} %{{arch}}" {pkg}')
-        ).stdout.split(" ")
-
-        arch = "amd64" if arch == "x86_64" else arch
-
-        index_json, _, _ = await read_in_oci_image(pkg_name)
-
-        manifests.extend(
-            [
-                DockerManifest(
-                    size=manifest.size,
-                    digest=manifest.digest,
-                    platform=DockerManifest.Platform(architecture=arch, os="linux"),
-                )
-                for manifest in index_json.manifests
-            ]
+    if len(pkgs) != 1:
+        raise ValueError(
+            f"got more than one package providing {name} = {reference}: {pkgs}"
         )
 
-    return Response(
-        content=(ManifestListV2Reply(manifests=manifests)).model_dump_json(),
-        # content=index_json.model_dump_json(),
-        media_type=MANIFEST_LIST_V2_MEDIA_TYPE,
-    )
+    files = (await run_cmd(f"rpm -ql {pkgs[0]}")).stdout.splitlines()
+    for fname in files:
+        if fname.endswith("index.json"):
+            return FileResponse(path=fname, media_type=OCI_IMAGE_INDEX_JSON_MEDIA_TYPE)
+
+    raise ValueError(f"package {pkgs[0]} has no index.json")
